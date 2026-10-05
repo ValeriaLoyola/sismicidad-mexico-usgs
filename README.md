@@ -8,6 +8,11 @@ Proyecto de análisis exploratorio y aprendizaje no supervisado sobre eventos s�
 **Herramienta principal:** R / R Markdown  
 **Visualización final:** Flexdashboard
 
+## Enlaces del proyecto
+
+- [Ver Flexdashboard](https://valerialoyola.github.io/sismicidad-mexico-usgs/)
+- [Ver reporte completo](https://valerialoyola.github.io/sismicidad-mexico-usgs/reporte.html)
+- [Ver repositorio en GitHub](https://github.com/ValeriaLoyola/sismicidad-mexico-usgs)
 ---
 
 ## 1. Objetivo
