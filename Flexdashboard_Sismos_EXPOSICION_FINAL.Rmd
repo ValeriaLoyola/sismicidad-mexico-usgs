@@ -1,0 +1,954 @@
+---
+title: "Sismicidad M≥5 en México y su entorno"
+author: "Karla Valeria Loyola Alarcón"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+    theme: yeti
+    source_code: embed
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.retina = 2
+)
+
+paquetes <- c(
+  "flexdashboard", "tidyverse", "lubridate", "sf",
+  "cluster", "maps", "scales"
+)
+
+faltantes <- paquetes[!vapply(paquetes, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(faltantes) > 0) {
+  stop(
+    paste0(
+      "Instala primero estos paquetes: ",
+      paste(faltantes, collapse = ", ")
+    )
+  )
+}
+
+library(flexdashboard)
+library(tidyverse)
+library(lubridate)
+library(sf)
+library(cluster)
+library(maps)
+library(scales)
+
+# -----------------------------------------------------------------------------
+# Archivos del proyecto
+# -----------------------------------------------------------------------------
+archivo_dashboard <- file.path("data", "processed", "sismos_dashboard.csv")
+archivo_placas <- file.path("data", "external", "PB2002_boundaries.json")
+
+if (!file.exists(archivo_dashboard)) {
+  stop(
+    paste0(
+      "No se encontró '", archivo_dashboard, "'. ",
+      "Primero renderiza ANALISIS_SISMOS_FINAL.Rmd para generar la base procesada."
+    )
+  )
+}
+
+sismos <- readr::read_csv(
+  archivo_dashboard,
+  show_col_types = FALSE
+)
+
+# La exportación del reporte conserva el número de clúster de K-Means.
+sismos <- sismos %>%
+  mutate(
+    cluster_num = readr::parse_number(as.character(cluster_kmeans)),
+    perfil = factor(
+      cluster_num,
+      levels = c(1, 2, 3),
+      labels = c("Perfil 1", "Perfil 2", "Perfil 3")
+    ),
+    perfil_descriptivo = factor(
+      cluster_num,
+      levels = c(1, 2, 3),
+      labels = c(
+        "Sur-sureste\nsomero/intermedio",
+        "Sureste\nprofundo",
+        "Occidente-noroeste\nsuperficial"
+      )
+    ),
+    cluster_dbscan = as.character(cluster_dbscan)
+  )
+
+# Fecha para análisis temporal.
+if (!inherits(sismos$fecha_hora, "POSIXct")) {
+  sismos <- sismos %>%
+    mutate(
+      fecha_hora = suppressWarnings(
+        lubridate::ymd_hms(fecha_hora, tz = "UTC", quiet = TRUE)
+      )
+    )
+}
+
+sismos <- sismos %>%
+  mutate(
+    fecha = as.Date(fecha_hora),
+    anio = lubridate::year(fecha_hora)
+  )
+
+# -----------------------------------------------------------------------------
+# Métricas generales
+# -----------------------------------------------------------------------------
+n_eventos <- nrow(sismos)
+magnitud_maxima <- max(sismos$mag, na.rm = TRUE)
+profundidad_mediana <- median(sismos$depth, na.rm = TRUE)
+
+# Silhouette de la asignación final de K-Means, reconstruida con las mismas
+# variables utilizadas en el reporte: X, Y y profundidad estandarizadas.
+puntos_sf <- st_as_sf(
+  sismos,
+  coords = c("longitude", "latitude"),
+  crs = 4326,
+  remove = FALSE
+)
+
+puntos_lcc <- st_transform(puntos_sf, 6372)
+coord_lcc <- st_coordinates(puntos_lcc)
+
+X_dashboard <- sismos %>%
+  transmute(
+    X = coord_lcc[, 1],
+    Y = coord_lcc[, 2],
+    Profundidad = depth
+  ) %>%
+  scale()
+
+sil_dashboard <- cluster::silhouette(
+  sismos$cluster_num,
+  dist(X_dashboard)
+)
+
+silhouette_global <- mean(sil_dashboard[, "sil_width"])
+
+# Correlación profundidad-magnitud.
+cor_spearman <- cor.test(
+  sismos$depth,
+  sismos$mag,
+  method = "spearman",
+  exact = FALSE
+)
+
+rho <- unname(cor_spearman$estimate)
+p_spearman <- cor_spearman$p.value
+
+# Contraste externo de magnitud entre perfiles.
+kw <- kruskal.test(mag ~ perfil, data = sismos)
+H_kw <- unname(kw$statistic)
+k_kw <- nlevels(sismos$perfil)
+epsilon2 <- (H_kw - k_kw + 1) / (n_eventos - k_kw)
+
+# Resumen por perfil.
+perfil_resumen <- sismos %>%
+  group_by(perfil, perfil_descriptivo) %>%
+  summarise(
+    eventos = n(),
+    porcentaje = 100 * eventos / n_eventos,
+    profundidad_mediana = median(depth, na.rm = TRUE),
+    magnitud_mediana = median(mag, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Frecuencia acumulada por umbral de magnitud.
+umbrales <- seq(
+  5,
+  floor(max(sismos$mag, na.rm = TRUE) * 10) / 10,
+  by = 0.1
+)
+
+frecuencia_magnitud <- tibble(
+  umbral = umbrales,
+  eventos = map_int(
+    umbrales,
+    ~ sum(sismos$mag >= .x, na.rm = TRUE)
+  )
+) %>%
+  filter(eventos > 0)
+
+# Conteo anual. 2026 es un año parcial.
+eventos_anio <- sismos %>%
+  count(anio, name = "eventos") %>%
+  mutate(
+    periodo = if_else(anio == 2026, "2026 parcial", "Año completo")
+  )
+
+# Categorías descriptivas de profundidad.
+profundidad_categoria <- sismos %>%
+  mutate(
+    categoria = case_when(
+      depth < 70 ~ "Superficial (<70 km)",
+      depth < 300 ~ "Intermedia (70–300 km)",
+      TRUE ~ "Profunda (≥300 km)"
+    ),
+    categoria = factor(
+      categoria,
+      levels = c(
+        "Superficial (<70 km)",
+        "Intermedia (70–300 km)",
+        "Profunda (≥300 km)"
+      )
+    )
+  ) %>%
+  count(categoria, name = "eventos") %>%
+  mutate(porcentaje = 100 * eventos / sum(eventos))
+
+# DBSCAN: resumen directamente desde la clasificación exportada.
+dbscan_resumen <- sismos %>%
+  count(cluster_dbscan, name = "eventos") %>%
+  mutate(
+    cluster_dbscan = factor(
+      cluster_dbscan,
+      levels = c("D1", "D2", "Ruido")
+    )
+  ) %>%
+  arrange(cluster_dbscan)
+
+n_ruido <- sum(sismos$cluster_dbscan == "Ruido", na.rm = TRUE)
+porcentaje_ruido <- 100 * n_ruido / n_eventos
+n_d1 <- sum(sismos$cluster_dbscan == "D1", na.rm = TRUE)
+porcentaje_d1 <- 100 * n_d1 / n_eventos
+
+# Métricas pensadas para comunicar los hallazgos de forma no técnica.
+porcentaje_menor_6 <- 100 * mean(sismos$mag < 6, na.rm = TRUE)
+porcentaje_superficial <- 100 * mean(sismos$depth < 70, na.rm = TRUE)
+
+perfil_2_profundidad <- perfil_resumen %>%
+  filter(perfil == "Perfil 2") %>%
+  pull(profundidad_mediana)
+
+# Rangos simples de magnitud para una lectura inmediata.
+magnitud_rangos <- sismos %>%
+  mutate(
+    rango_magnitud = case_when(
+      mag < 5.5 ~ "5.0–5.4",
+      mag < 6.0 ~ "5.5–5.9",
+      mag < 7.0 ~ "6.0–6.9",
+      TRUE ~ "≥7.0"
+    ),
+    rango_magnitud = factor(
+      rango_magnitud,
+      levels = c("5.0–5.4", "5.5–5.9", "6.0–6.9", "≥7.0")
+    )
+  ) %>%
+  count(rango_magnitud, name = "eventos") %>%
+  tidyr::complete(
+    rango_magnitud,
+    fill = list(eventos = 0)
+  )
+
+# -----------------------------------------------------------------------------
+# Contexto tectónico externo
+# -----------------------------------------------------------------------------
+min_lon <- -118
+max_lon <- -86
+min_lat <- 14
+max_lat <- 33
+
+limites_estudio <- NULL
+
+if (file.exists(archivo_placas)) {
+  limites_placas <- st_read(archivo_placas, quiet = TRUE)
+
+  if (is.na(st_crs(limites_placas))) {
+    st_crs(limites_placas) <- 4326
+  }
+
+  bbox_estudio <- st_bbox(
+    c(
+      xmin = min_lon,
+      ymin = min_lat,
+      xmax = max_lon,
+      ymax = max_lat
+    ),
+    crs = st_crs(4326)
+  )
+
+  limites_estudio <- st_crop(limites_placas, bbox_estudio)
+}
+
+mapa_mundo <- map_data("world")
+
+# Paleta sobria y constante en todo el dashboard.
+colores_perfil <- c(
+  "Perfil 1" = "#B05A4F",
+  "Perfil 2" = "#2F7668",
+  "Perfil 3" = "#66758A"
+)
+
+colores_dbscan <- c(
+  "D1" = "#626B72",
+  "D2" = "#9B7442",
+  "Ruido" = "#B7B7B7"
+)
+
+tema_dashboard <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, colour = "#555555"),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    axis.title = element_text(size = 10)
+  )
+```
+
+
+
+<style>
+.side-note {
+  background: #eef1f0;
+  border-left: 5px solid #52675e;
+  padding: 22px 24px;
+  margin: 8px 12px;
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+.side-note strong {
+  color: #30383b;
+}
+
+.navbar-inverse {
+  background-color: #30363a;
+  border-color: #30363a;
+}
+.navbar-inverse .navbar-brand,
+.navbar-inverse .navbar-nav > li > a {
+  color: #ffffff;
+}
+.value-box {
+  border-radius: 4px;
+}
+.chart-title {
+  font-weight: 600;
+}
+.insight-box {
+  background: #f5f4f1;
+  border-left: 4px solid #6f655d;
+  padding: 14px 16px;
+  margin: 6px 0 12px 0;
+  line-height: 1.45;
+}
+.small-note {
+  color: #666666;
+  font-size: 12px;
+}
+.takeaway-box {
+  background: #eef1f0;
+  border-left: 5px solid #4f635b;
+  padding: 14px 18px;
+  margin: 6px 0 12px 0;
+  line-height: 1.45;
+  font-size: 14px;
+}
+.final-message {
+  background: #30363a;
+  color: #ffffff;
+  padding: 16px 20px;
+  border-radius: 4px;
+  margin: 4px 0 10px 0;
+  font-size: 17px;
+  line-height: 1.45;
+}
+.yes-box {
+  background: #eef3f0;
+  border-left: 4px solid #587064;
+  padding: 14px 16px;
+  line-height: 1.5;
+  min-height: 190px;
+}
+.no-box {
+  background: #f5f0ee;
+  border-left: 4px solid #87685b;
+  padding: 14px 16px;
+  line-height: 1.5;
+  min-height: 190px;
+}
+.small-note {
+  color: #666666;
+  font-size: 13px;
+  padding: 8px 12px;
+  text-align: center;
+}
+</style>
+
+Panorama
+=====================================
+
+Row {data-height=115}
+-------------------------------------
+
+### Eventos analizados
+
+```{r}
+valueBox(
+  format(n_eventos, big.mark = ","),
+  caption = "Eventos M≥5",
+  color = "#4B545A"
+)
+```
+
+### Magnitud máxima
+
+```{r}
+valueBox(
+  sprintf("%.1f", magnitud_maxima),
+  caption = "Máxima observada",
+  color = "#725B4E"
+)
+```
+
+### Profundidad mediana
+
+```{r}
+valueBox(
+  sprintf("%.1f km", profundidad_mediana),
+  caption = "Mediana del catálogo",
+  color = "#5F6A63"
+)
+```
+
+### Calidad K-Means
+
+```{r}
+valueBox(
+  sprintf("%.3f", silhouette_global),
+  caption = "Silhouette, K = 3",
+  color = "#5A6578"
+)
+```
+
+Row {data-height=540}
+-------------------------------------
+
+### ¿Dónde aparecen los perfiles? {data-width=8}
+
+```{r}
+graf_mapa <- ggplot() +
+  geom_polygon(
+    data = mapa_mundo,
+    aes(x = long, y = lat, group = group),
+    fill = "#F3F3F1",
+    color = "#D2D2CE",
+    linewidth = 0.2
+  )
+
+if (!is.null(limites_estudio)) {
+  graf_mapa <- graf_mapa +
+    geom_sf(
+      data = limites_estudio,
+      inherit.aes = FALSE,
+      linewidth = 0.60,
+      color = "#333333",
+      alpha = 0.85
+    )
+}
+
+graf_mapa +
+  geom_point(
+    data = sismos,
+    aes(
+      x = longitude,
+      y = latitude,
+      color = perfil,
+      size = mag
+    ),
+    alpha = 0.72
+  ) +
+  scale_color_manual(values = colores_perfil) +
+  scale_size_continuous(range = c(1.3, 5.8)) +
+  coord_sf(
+    xlim = c(min_lon, max_lon),
+    ylim = c(min_lat, max_lat),
+    expand = FALSE,
+    default_crs = st_crs(4326)
+  ) +
+  labs(
+    title = "Perfiles estadísticos y contexto tectónico",
+    subtitle = "PB2002 se usa solo como referencia externa; el tamaño representa magnitud",
+    x = "Longitud",
+    y = "Latitud",
+    color = "Perfil",
+    size = "Magnitud"
+  ) +
+  tema_dashboard
+```
+
+### La profundidad separa los perfiles {data-width=4}
+
+```{r}
+ggplot(
+  perfil_resumen,
+  aes(
+    x = perfil,
+    y = profundidad_mediana,
+    fill = perfil
+  )
+) +
+  geom_col(width = 0.62, show.legend = FALSE) +
+  geom_text(
+    aes(label = sprintf("%.1f km", profundidad_mediana)),
+    vjust = -0.5,
+    fontface = "bold",
+    size = 4
+  ) +
+  scale_fill_manual(values = colores_perfil) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Profundidad mediana por perfil",
+    subtitle = "El Perfil 2 constituye el grupo de mayor profundidad",
+    x = NULL,
+    y = "Profundidad mediana (km)"
+  ) +
+  tema_dashboard +
+  theme(legend.position = "none")
+```
+
+<div class="insight-box">
+<strong>Lectura principal.</strong> Los eventos no se distribuyen de forma homogénea. K-Means resume el catálogo en tres perfiles definidos por localización y profundidad; el Perfil 2 destaca por una profundidad mediana cercana a 104 km. Los perfiles son estadísticos, no regiones tectónicas oficiales.
+</div>
+
+Patrones del catálogo
+=====================================
+
+Row {data-height=120}
+-------------------------------------
+
+### Eventos menores a M6
+
+```{r}
+valueBox(
+  sprintf("%.1f%%", porcentaje_menor_6),
+  caption = "del catálogo",
+  color = "#5B646A"
+)
+```
+
+### Eventos a menos de 70 km
+
+```{r}
+valueBox(
+  sprintf("%.1f%%", porcentaje_superficial),
+  caption = "del catálogo",
+  color = "#65746B"
+)
+```
+
+### Profundidad vs. magnitud
+
+```{r}
+valueBox(
+  sprintf("%.2f", rho),
+  caption = "Correlación muy débil",
+  color = "#7A6257"
+)
+```
+
+### Periodo 2026
+
+```{r}
+valueBox(
+  "Parcial",
+  caption = "Hasta el 19 de septiembre",
+  color = "#6A6870"
+)
+```
+
+Row {data-height=430}
+-------------------------------------
+
+### A mayor magnitud, menos eventos {data-width=8}
+
+```{r}
+ggplot(
+  magnitud_rangos,
+  aes(
+    x = rango_magnitud,
+    y = eventos
+  )
+) +
+  geom_col(
+    width = 0.62,
+    fill = "#59656B"
+  ) +
+  geom_text(
+    aes(label = eventos),
+    vjust = -0.5,
+    fontface = "bold",
+    size = 4.5
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    x = "Rango de magnitud",
+    y = "Número de eventos"
+  ) +
+  tema_dashboard
+```
+
+### ¿Qué vemos? {data-width=4}
+
+<div class="side-note">
+
+<strong>Los eventos grandes son mucho menos frecuentes.</strong><br><br>
+
+De los 422 sismos analizados, la gran mayoría se encuentra cerca del umbral de magnitud 5.<br><br>
+
+Solo una proporción pequeña alcanza magnitudes de 6 o más.<br><br>
+
+<strong>Idea clave:</strong> conforme aumenta la magnitud, disminuye claramente el número de eventos registrados.
+
+</div>
+
+
+Row {data-height=430}
+-------------------------------------
+
+### Profundidad y magnitud no muestran una relación clara {data-width=8}
+
+```{r}
+ggplot(
+  sismos,
+  aes(
+    x = depth,
+    y = mag
+  )
+) +
+  geom_point(
+    alpha = 0.5,
+    size = 2,
+    color = "#59656B"
+  ) +
+  labs(
+    x = "Profundidad (km)",
+    y = "Magnitud"
+  ) +
+  tema_dashboard
+```
+
+### ¿Qué vemos? {data-width=4}
+
+<div class="side-note">
+
+<strong>Un sismo más profundo no necesariamente es más fuerte.</strong><br><br>
+
+Los puntos aparecen dispersos y no forman una tendencia clara.<br><br>
+
+La correlación obtenida fue de aproximadamente <strong>-0.09</strong>, es decir, muy cercana a cero.<br><br>
+
+<strong>Idea clave:</strong> dentro de esta muestra, la profundidad no explica la magnitud del evento.
+
+</div>
+
+
+Row {data-height=430}
+-------------------------------------
+
+### La cantidad de eventos cambia entre años {data-width=8}
+
+```{r}
+ggplot(
+  eventos_anio,
+  aes(
+    x = factor(anio),
+    y = eventos,
+    fill = periodo
+  )
+) +
+  geom_col(
+    width = 0.68
+  ) +
+  geom_text(
+    aes(label = eventos),
+    vjust = -0.45,
+    fontface = "bold",
+    size = 4
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Año completo" = "#66727A",
+      "2026 parcial" = "#A78A79"
+    )
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.14))
+  ) +
+  labs(
+    x = "Año",
+    y = "Número de eventos",
+    fill = NULL
+  ) +
+  tema_dashboard +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    legend.position = "bottom"
+  )
+```
+
+### ¿Qué vemos? {data-width=4}
+
+<div class="side-note">
+
+<strong>El número de eventos registrados cambia de un año a otro.</strong><br><br>
+
+No se observa un incremento continuo durante todo el periodo.<br><br>
+
+2026 aparece destacado porque solo contiene información hasta el <strong>19 de septiembre</strong>.<br><br>
+
+<strong>Idea clave:</strong> esta gráfica describe variación temporal, pero no demuestra por sí sola que la actividad sísmica esté aumentando.
+
+</div>
+
+Modelo y sensibilidad
+=====================================
+
+Row {data-height=155}
+-------------------------------------
+
+### Cómo se eligió K = 3
+
+<div class="insight-box">
+<strong>K-Means es el modelo principal.</strong> La Silhouette favorece una solución más parsimoniosa con K = 2, pero K = 3 conserva una calidad cercana y permite separar un perfil profundo claramente interpretable. El codo y el Gap Statistic se usan como criterios complementarios. Por ello, K = 3 se interpreta como una segmentación descriptiva útil, no como prueba de tres poblaciones sísmicas naturalmente separadas.
+</div>
+
+Row {data-height=455}
+-------------------------------------
+
+### Qué distingue a los perfiles {data-width=6}
+
+```{r}
+ggplot(
+  perfil_resumen,
+  aes(
+    x = perfil,
+    y = porcentaje,
+    fill = perfil
+  )
+) +
+  geom_col(width = 0.62, show.legend = FALSE) +
+  geom_text(
+    aes(
+      label = paste0(
+        eventos, " eventos\n",
+        sprintf("%.1f%%", porcentaje)
+      )
+    ),
+    vjust = -0.25,
+    size = 3.7
+  ) +
+  scale_fill_manual(values = colores_perfil) +
+  scale_y_continuous(
+    labels = label_percent(scale = 1),
+    expand = expansion(mult = c(0, 0.17))
+  ) +
+  labs(
+    title = "Peso de cada perfil en el catálogo",
+    subtitle = "La segmentación resume posición y profundidad",
+    x = NULL,
+    y = "Participación"
+  ) +
+  tema_dashboard +
+  theme(legend.position = "none")
+```
+
+### Magnitud como contraste externo {data-width=6}
+
+```{r}
+ggplot(
+  sismos,
+  aes(x = perfil, y = mag, fill = perfil)
+) +
+  geom_boxplot(alpha = 0.72, width = 0.62, show.legend = FALSE) +
+  scale_fill_manual(values = colores_perfil) +
+  labs(
+    title = "Magnitud por perfil",
+    subtitle = paste0(
+      "Kruskal-Wallis p = ", format.pval(kw$p.value, digits = 3),
+      "; ε² = ", sprintf("%.3f", epsilon2),
+      " (efecto pequeño)"
+    ),
+    x = NULL,
+    y = "Magnitud"
+  ) +
+  tema_dashboard +
+  theme(legend.position = "none")
+```
+
+Row {data-height=430}
+-------------------------------------
+
+### DBSCAN: qué cambia con otro supuesto {data-width=7}
+
+```{r}
+ggplot(
+  dbscan_resumen,
+  aes(
+    x = cluster_dbscan,
+    y = eventos,
+    fill = cluster_dbscan
+  )
+) +
+  geom_col(width = 0.62, show.legend = FALSE) +
+  geom_text(
+    aes(label = eventos),
+    vjust = -0.5,
+    fontface = "bold",
+    size = 4
+  ) +
+  scale_fill_manual(values = colores_dbscan, drop = FALSE) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "DBSCAN no reproduce los tres perfiles",
+    subtitle = paste0(
+      n_d1, " de ", n_eventos,
+      " eventos quedan en D1; ",
+      n_ruido, " (", sprintf("%.1f", porcentaje_ruido), "%) son ruido"
+    ),
+    x = "Clasificación DBSCAN",
+    y = "Número de eventos"
+  ) +
+  tema_dashboard
+```
+
+### Interpretación de sensibilidad {data-width=5}
+
+<div class="insight-box">
+<strong>Resultado clave.</strong> DBSCAN encuentra una estructura basada en densidad mucho menos fragmentada que K-Means. Esto indica que la partición exacta de tres perfiles depende del supuesto del algoritmo. La comparación fortalece el análisis porque evita presentar K = 3 como una verdad geológica o como tres poblaciones naturalmente separadas.
+</div>
+
+<div class="small-note">
+La magnitud no participa en la construcción de K-Means; se utiliza después para caracterizar los grupos. Esto evita una validación circular.
+</div>
+
+Conclusiones
+=====================================
+
+Row {data-height=120}
+-------------------------------------
+
+### Mensaje final
+
+<div class="final-message">
+<strong>El hallazgo principal:</strong> los eventos se diferencian mucho más por <strong>dónde ocurren y a qué profundidad</strong> que por su magnitud. K-Means ayuda a resumir esa heterogeneidad en tres perfiles, pero DBSCAN muestra que esos tres perfiles no deben interpretarse como tres poblaciones naturales ni como regiones tectónicas definitivas.
+</div>
+
+Row {data-height=420}
+-------------------------------------
+
+### La profundidad es la diferencia más visible entre perfiles {data-width=7}
+
+```{r}
+ggplot(
+  perfil_resumen,
+  aes(
+    x = perfil,
+    y = profundidad_mediana,
+    fill = perfil
+  )
+) +
+  geom_col(
+    width = 0.62,
+    show.legend = FALSE
+  ) +
+  geom_text(
+    aes(
+      label = paste0(
+        sprintf("%.1f", profundidad_mediana),
+        " km\n",
+        sprintf("%.1f%%", porcentaje),
+        " del catálogo"
+      )
+    ),
+    vjust = -0.35,
+    fontface = "bold",
+    size = 3.8
+  ) +
+  scale_fill_manual(values = colores_perfil) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title = "Tres perfiles útiles para describir el catálogo",
+    subtitle = "El Perfil 2 destaca por su profundidad mediana cercana a 104 km",
+    x = NULL,
+    y = "Profundidad mediana (km)"
+  ) +
+  tema_dashboard +
+  theme(legend.position = "none")
+```
+
+### Cómo interpretar el modelo {data-width=5}
+
+<div class="insight-box">
+<strong>1. Qué encontramos.</strong><br>
+Tres perfiles con combinaciones distintas de localización y profundidad.<br><br>
+
+<strong>2. Qué aporta K-Means.</strong><br>
+Resume 422 eventos en grupos fáciles de comparar y hace visible el perfil profundo.<br><br>
+
+<strong>3. Qué nos advierte DBSCAN.</strong><br>
+`r sprintf("%.1f%%", porcentaje_d1)` de los eventos cae en un solo grupo de densidad. Por eso los tres perfiles son una segmentación útil, no tres grupos “naturales”.<br><br>
+
+<strong>4. Qué papel juega la magnitud.</strong><br>
+Ayuda a caracterizar los perfiles después del agrupamiento, pero las diferencias son pequeñas frente a las de profundidad y localización.
+</div>
+
+Row {data-height=280}
+-------------------------------------
+
+### Lo que sí aporta este proyecto {data-width=6}
+
+<div class="yes-box">
+
+<strong>Sí permite:</strong><br><br>
+
+✓ describir dónde y a qué profundidad se concentran los eventos M≥5;<br>
+✓ resumir el catálogo en perfiles comparables;<br>
+✓ identificar un perfil de eventos claramente más profundos;<br>
+✓ comprobar que la conclusión depende del método de agrupamiento y comunicar esa limitación.
+
+</div>
+
+### Lo que no debe concluirse {data-width=6}
+
+<div class="no-box">
+
+<strong>No implica:</strong><br><br>
+
+✗ que existan exactamente tres tipos naturales de sismos;<br>
+✗ que cada perfil corresponda a una placa tectónica específica;<br>
+✗ que profundidad determine magnitud;<br>
+✗ que el análisis permita predecir cuándo o dónde ocurrirá el siguiente sismo.
+
+</div>
+
+
+Row {data-height=80}
+-------------------------------------
+
+### Alcance de los datos
+
+<div class="small-note">
+<strong>Fuente:</strong> USGS ComCat &nbsp; | &nbsp;
+<strong>Periodo:</strong> 2015-01-01 a 2026-09-19 &nbsp; | &nbsp;
+<strong>Dominio:</strong> 14°–33° N y −118°–−86°.
+</div>

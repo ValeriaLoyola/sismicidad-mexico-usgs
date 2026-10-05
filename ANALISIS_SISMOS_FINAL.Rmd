@@ -1,0 +1,2171 @@
+---
+title: "Análisis de la actividad sísmica en México y su entorno"
+author: "Karla Valeria Loyola Alarcón"
+date: "2026-10-03"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    code_folding: hide
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5.2,
+  fig.align = "center",
+  out.width = "95%"
+)
+
+options(
+  scipen = 999,
+  stringsAsFactors = FALSE
+)
+
+paquetes <- c(
+  "tidyverse",
+  "lubridate",
+  "knitr",
+  "cluster",
+  "dbscan",
+  "maps",
+  "sf"
+)
+
+faltantes <- paquetes[
+  !vapply(
+    paquetes,
+    requireNamespace,
+    FUN.VALUE = logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(faltantes) > 0) {
+  stop(
+    paste0(
+      "Faltan paquetes: ",
+      paste(faltantes, collapse = ", "),
+      ". Instálalos antes de tejer el reporte con: install.packages(c(",
+      paste(sprintf('"%s"', faltantes), collapse = ", "),
+      "))"
+    )
+  )
+}
+
+library(tidyverse)
+library(lubridate)
+library(knitr)
+library(cluster)
+library(dbscan)
+library(maps)
+library(sf)
+
+set.seed(123)
+
+tema_reporte <- theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 10, color = "gray35"),
+    axis.title = element_text(size = 11),
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(8, 8, 8, 8)
+  )
+```
+
+# Problema y contexto
+
+México se localiza en una región de alta complejidad tectónica. La actividad sísmica registrada en el país y su entorno presenta heterogeneidad espacial y en profundidad, por lo que resulta pertinente estudiar si esa heterogeneidad puede resumirse mediante perfiles estadísticos de eventos.
+
+Este proyecto analiza eventos sísmicos de magnitud mayor o igual a 5 registrados entre 2015 y el 19 de septiembre de 2026 dentro de una región que comprende México y zonas adyacentes. El objetivo es **describir patrones presentes en el catálogo y evaluar si existen perfiles estadísticos diferenciables**, no predecir cuándo ocurrirá un terremoto.
+
+La fuente principal es el catálogo ComCat del **United States Geological Survey (USGS)**, consultado mediante el servicio FDSN Event Web Service. Debido a que ComCat integra información de distintas redes y puede actualizar parámetros preferidos de un evento, el proyecto conserva una copia local de los datos utilizados para que el análisis sea reproducible.
+
+# Pregunta de investigación y diseño analítico
+
+## Pregunta principal
+
+**¿Se pueden identificar perfiles estadísticos diferenciados de sismicidad de magnitud ≥ 5 en México y su entorno a partir de la localización y profundidad de los eventos, y presentan esos perfiles diferencias en magnitud?**
+
+Esta formulación separa dos tareas:
+
+1. construir los perfiles utilizando únicamente información espacial y profundidad;
+2. utilizar la magnitud como variable externa para caracterizar y contrastar los grupos resultantes.
+
+## Preguntas secundarias
+
+- ¿Cómo se distribuyen espacial y temporalmente los eventos del periodo analizado?
+- ¿Cómo se distribuyen la magnitud y la profundidad?
+- ¿Existe una asociación monotónica entre profundidad y magnitud?
+- ¿Cómo disminuye la frecuencia acumulada de eventos al aumentar el umbral de magnitud?
+- ¿Cuántos grupos ofrece un equilibrio razonable entre separación, parsimonia e interpretabilidad?
+- ¿Los grupos construidos con posición y profundidad presentan diferencias en magnitud?
+- ¿La estructura identificada por K-Means es compatible con una segmentación alternativa basada en densidad que permite observaciones de ruido?
+- ¿La distribución espacial de los perfiles es compatible, de manera descriptiva, con el contexto tectónico conocido de la región?
+
+## Hipótesis de trabajo
+
+Se plantea que los eventos sísmicos de magnitud ≥ 5 registrados en el dominio de estudio presentan una estructura espacial y de profundidad heterogénea que puede resumirse mediante un número reducido de perfiles estadísticos. La magnitud se reserva como variable externa para evaluar si dichos perfiles también difieren en el tamaño de los eventos.
+
+## Elementos del diseño
+
+| Elemento | Definición |
+|---|---|
+| Población de interés | Eventos incluidos en ComCat con magnitud preferida ≥ 5 dentro del dominio geográfico y periodo definidos |
+| Unidad de análisis | Un evento sísmico |
+| Variable objetivo | No existe una variable objetivo observada, porque el problema es no supervisado. El resultado generado por el modelo es la asignación de clúster |
+| Variables utilizadas por K-Means | Coordenadas proyectadas \(X\), \(Y\) y profundidad |
+| Variable externa de caracterización | Magnitud preferida reportada por USGS |
+| Técnica de sensibilidad | DBSCAN sobre las mismas variables estandarizadas \(X\), \(Y\) y profundidad |
+| Periodo | 1 de enero de 2015 a 19 de septiembre de 2026 |
+| Alcance geográfico | Latitud 14°–33° N y longitud -118°–-86° |
+| Alcance analítico | Descriptivo, exploratorio y de aprendizaje no supervisado |
+
+# Datos y reproducibilidad
+
+## Fuente y criterio de extracción
+
+El servicio FDSN de USGS permite consultar eventos mediante parámetros temporales, espaciales y de magnitud. Se utiliza una fecha de corte fija para que el periodo de análisis no cambie en cada ejecución.
+
+Los límites de extracción son:
+
+- latitud: 14° a 33° N;
+- longitud: -118° a -86°;
+- magnitud mínima: 5;
+- periodo: 2015-01-01 a 2026-09-19, inclusive.
+
+La consulta anual utiliza intervalos temporales semiabiertos: cada año completo termina al iniciar el 1 de enero del año siguiente y el periodo 2026 termina al iniciar el 20 de septiembre. Esto evita omitir los eventos del último día de cada ventana.
+
+```{r descarga-datos}
+min_lat <- 14
+max_lat <- 33
+min_lon <- -118
+max_lon <- -86
+magnitud_minima <- 5
+
+anios <- 2015:2026
+fecha_corte_inclusiva <- as.Date("2026-09-19")
+
+dir.create("data/raw", recursive = TRUE, showWarnings = FALSE)
+
+archivo_raw <- file.path(
+  "data",
+  "raw",
+  "usgs_sismos_2015_2026-09-19.csv"
+)
+
+descargar_anio <- function(anio) {
+
+  inicio <- as.POSIXct(
+    paste0(anio, "-01-01 00:00:00"),
+    tz = "UTC"
+  )
+
+  fin <- if (anio == 2026) {
+    as.POSIXct(
+      fecha_corte_inclusiva + days(1),
+      tz = "UTC"
+    )
+  } else {
+    as.POSIXct(
+      paste0(anio + 1, "-01-01 00:00:00"),
+      tz = "UTC"
+    )
+  }
+
+  inicio_txt <- format(
+    inicio,
+    "%Y-%m-%dT%H:%M:%S",
+    tz = "UTC"
+  )
+
+  fin_txt <- format(
+    fin,
+    "%Y-%m-%dT%H:%M:%S",
+    tz = "UTC"
+  )
+
+  url <- paste0(
+    "https://earthquake.usgs.gov/fdsnws/event/1/query?format=csv",
+    "&starttime=", inicio_txt,
+    "&endtime=", fin_txt,
+    "&minmagnitude=", magnitud_minima,
+    "&minlatitude=", min_lat,
+    "&maxlatitude=", max_lat,
+    "&minlongitude=", min_lon,
+    "&maxlongitude=", max_lon
+  )
+
+  readr::read_csv(
+    url,
+    show_col_types = FALSE,
+    progress = FALSE
+  ) %>%
+    mutate(anio_descarga = anio)
+}
+
+if (file.exists(archivo_raw)) {
+
+  df_raw <- readr::read_csv(
+    archivo_raw,
+    show_col_types = FALSE
+  )
+
+} else {
+
+  df_raw <- purrr::map_dfr(
+    anios,
+    descargar_anio
+  )
+
+  readr::write_csv(
+    df_raw,
+    archivo_raw
+  )
+}
+
+cat(
+  "Registros en la copia local:",
+  nrow(df_raw),
+  "\n"
+)
+
+cat(
+  "Variables disponibles:",
+  ncol(df_raw),
+  "\n"
+)
+```
+
+> **Decisión de reproducibilidad.** Una vez generada, la copia `data/raw/usgs_sismos_2015_2026-09-19.csv` debe conservarse en el repositorio. Esto evita que futuras actualizaciones de ComCat modifiquen silenciosamente los resultados del proyecto.
+
+## Periodo realmente observado
+
+```{r periodo-observado}
+fecha_raw <- as.Date(
+  substr(df_raw$time, 1, 10)
+)
+
+fecha_minima <- min(
+  fecha_raw,
+  na.rm = TRUE
+)
+
+fecha_maxima <- max(
+  fecha_raw,
+  na.rm = TRUE
+)
+
+tibble(
+  fecha_inicial = fecha_minima,
+  fecha_final = fecha_maxima
+) %>%
+  kable(
+    caption = "Periodo observado en la copia local"
+  )
+```
+
+El año 2026 es parcial, por lo que sus conteos anuales no se interpretan como directamente equivalentes a un año completo.
+
+# Exploración y preparación de los datos
+
+La preparación se realiza antes del análisis sustantivo. El objetivo es distinguir entre: (a) problemas que requieren una corrección o exclusión y (b) valores poco frecuentes que son plausibles y contienen información relevante.
+
+## Estructura de la base
+
+```{r estructura-datos}
+estructura <- tibble(
+  variable = names(df_raw),
+  tipo = map_chr(
+    df_raw,
+    ~ paste(class(.x), collapse = "/")
+  )
+)
+
+kable(
+  estructura,
+  caption = "Variables y tipos de datos en la descarga original"
+)
+```
+
+La base contiene variables del evento, de la localización, de la magnitud y metadatos sobre la fuente y calidad de la estimación. El análisis principal no utiliza todas las variables disponibles; se conservan para evaluar la calidad y procedencia de los registros.
+
+## Tipo de evento y duplicados
+
+Primero se inspecciona la variable `type`. El proyecto se restringe a registros clasificados como `earthquake`.
+
+```{r tipo-evento}
+tabla_tipo <- df_raw %>%
+  count(type, name = "n") %>%
+  mutate(
+    porcentaje = 100 * n / sum(n)
+  )
+
+kable(
+  tabla_tipo,
+  digits = 2,
+  caption = "Tipos de evento presentes en la descarga"
+)
+```
+
+```{r filtro-eventos}
+df <- df_raw %>%
+  filter(type == "earthquake")
+
+n_duplicados_id <- sum(
+  duplicated(df$id)
+)
+
+tibble(
+  criterio = "ID duplicado",
+  registros = n_duplicados_id
+) %>%
+  kable(
+    caption = "Diagnóstico de duplicados"
+  )
+
+df <- df %>%
+  distinct(
+    id,
+    .keep_all = TRUE
+  )
+```
+
+**Decisión.** Si existieran IDs repetidos, se conservaría una sola fila por identificador porque `id` representa un evento de ComCat. Esta depuración evita contabilizar el mismo evento más de una vez.
+
+## Preparación de fechas
+
+```{r preparar-fechas}
+meses_es <- c(
+  "Ene", "Feb", "Mar", "Abr",
+  "May", "Jun", "Jul", "Ago",
+  "Sep", "Oct", "Nov", "Dic"
+)
+
+df <- df %>%
+  mutate(
+    fecha_hora = ymd_hms(
+      time,
+      tz = "UTC",
+      quiet = TRUE
+    ),
+    fecha = as.Date(fecha_hora),
+    anio = year(fecha_hora),
+    mes_num = month(fecha_hora),
+    mes = factor(
+      meses_es[mes_num],
+      levels = meses_es
+    )
+  )
+```
+
+## Valores faltantes
+
+```{r faltantes-tabla}
+tabla_na <- tibble(
+  variable = names(df),
+  faltantes = map_int(
+    df,
+    ~ sum(is.na(.x))
+  )
+) %>%
+  mutate(
+    porcentaje = 100 * faltantes / nrow(df)
+  ) %>%
+  arrange(desc(porcentaje))
+
+kable(
+  tabla_na,
+  digits = 2,
+  caption = "Valores faltantes por variable"
+)
+```
+
+Para concentrar la visualización en las variables con ausencias:
+
+```{r faltantes-grafica}
+tabla_na %>%
+  filter(faltantes > 0) %>%
+  ggplot(
+    aes(
+      x = reorder(variable, porcentaje),
+      y = porcentaje
+    )
+  ) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Porcentaje de valores faltantes",
+    subtitle = "Se muestran únicamente variables con al menos un valor ausente",
+    x = NULL,
+    y = "Valores faltantes (%)"
+  ) +
+  tema_reporte
+```
+
+**Decisión.** No se imputan automáticamente variables con información faltante. Las variables con alta ausencia que no forman parte de la pregunta de investigación se conservan como metadatos, pero no se incorporan al modelo. Para las variables esenciales del análisis (`fecha_hora`, `latitude`, `longitude`, `depth` y `mag`) se utiliza análisis de casos completos y se reporta cuántos registros se excluyen.
+
+## Consistencia y rangos
+
+Se comprueba que las variables principales respeten las restricciones definidas por la consulta y que las fechas hayan sido interpretadas correctamente.
+
+```{r validacion-rangos}
+validacion_rangos <- tibble(
+  regla = c(
+    "Latitud fuera del dominio [14, 33]",
+    "Longitud fuera del dominio [-118, -86]",
+    "Magnitud menor a 5",
+    "Fecha sin interpretar",
+    "Fecha fuera del periodo definido",
+    "Profundidad negativa: revisar"
+  ),
+  registros = c(
+    sum(
+      !between(df$latitude, min_lat, max_lat),
+      na.rm = TRUE
+    ),
+    sum(
+      !between(df$longitude, min_lon, max_lon),
+      na.rm = TRUE
+    ),
+    sum(
+      df$mag < magnitud_minima,
+      na.rm = TRUE
+    ),
+    sum(
+      is.na(df$fecha_hora)
+    ),
+    sum(
+      df$fecha < as.Date("2015-01-01") |
+        df$fecha > fecha_corte_inclusiva,
+      na.rm = TRUE
+    ),
+    sum(
+      df$depth < 0,
+      na.rm = TRUE
+    )
+  )
+)
+
+kable(
+  validacion_rangos,
+  caption = "Validaciones de consistencia de las variables principales"
+)
+```
+
+Los registros que incumplieran una regla no se eliminarían por una condición genérica sin ser inspeccionados. En particular, un valor extremo en magnitud o profundidad no es equivalente a un error de captura.
+
+## Heterogeneidad metodológica de la fuente
+
+ComCat integra productos de diferentes redes y utiliza una magnitud preferida por evento. El tipo de magnitud (`magType`) puede variar entre registros y no todos los métodos de magnitud son estrictamente equivalentes. Por ello, se documenta su composición y su posible cambio a lo largo del periodo.
+
+```{r tipos-magnitud}
+if ("magType" %in% names(df)) {
+
+  tabla_magtype <- df %>%
+    count(
+      magType,
+      sort = TRUE,
+      name = "n"
+    ) %>%
+    mutate(
+      porcentaje = 100 * n / sum(n)
+    )
+
+  kable(
+    tabla_magtype,
+    digits = 2,
+    caption = "Métodos de magnitud presentes en el catálogo"
+  )
+}
+```
+
+```{r magtype-tiempo}
+if ("magType" %in% names(df)) {
+
+  df %>%
+    filter(
+      !is.na(anio),
+      !is.na(magType)
+    ) %>%
+    count(
+      anio,
+      magType
+    ) %>%
+    group_by(anio) %>%
+    mutate(
+      proporcion = n / sum(n)
+    ) %>%
+    ungroup() %>%
+    ggplot(
+      aes(
+        x = factor(anio),
+        y = proporcion,
+        fill = magType
+      )
+    ) +
+    geom_col(
+      position = "fill"
+    ) +
+    scale_y_continuous(
+      labels = scales::percent_format()
+    ) +
+    labs(
+      title = "Composición del tipo de magnitud por año",
+      subtitle = "Permite detectar cambios en la mezcla de métodos de medición",
+      x = "Año",
+      y = "Proporción",
+      fill = "Tipo de magnitud"
+    ) +
+    tema_reporte
+}
+```
+
+**Decisión.** No se transforma cada tipo de magnitud a una escala común porque no se dispone de una ecuación de conversión única y válida para todos los eventos. Se utiliza la magnitud preferida reportada por USGS y se reconoce la heterogeneidad de `magType` como una limitación. Esto es especialmente relevante al interpretar diferencias pequeñas de magnitud entre grupos.
+
+## Valores atípicos
+
+Los valores atípicos se identifican mediante la regla del rango intercuartílico (IQR) únicamente como diagnóstico.
+
+```{r diagnostico-atipicos}
+diagnosticar_iqr <- function(x) {
+
+  q1 <- quantile(
+    x,
+    0.25,
+    na.rm = TRUE
+  )
+
+  q3 <- quantile(
+    x,
+    0.75,
+    na.rm = TRUE
+  )
+
+  iqr <- q3 - q1
+
+  inferior <- q1 - 1.5 * iqr
+  superior <- q3 + 1.5 * iqr
+
+  tibble(
+    q1 = q1,
+    q3 = q3,
+    limite_inferior = inferior,
+    limite_superior = superior,
+    n_atipicos = sum(
+      x < inferior | x > superior,
+      na.rm = TRUE
+    )
+  )
+}
+
+diagnostico_atipicos <- bind_rows(
+  diagnosticar_iqr(df$mag) %>%
+    mutate(variable = "Magnitud"),
+  diagnosticar_iqr(df$depth) %>%
+    mutate(variable = "Profundidad")
+) %>%
+  select(
+    variable,
+    everything()
+  )
+
+kable(
+  diagnostico_atipicos,
+  digits = 2,
+  caption = "Diagnóstico de valores atípicos mediante IQR"
+)
+```
+
+```{r boxplots-atipicos}
+df %>%
+  select(
+    mag,
+    depth
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "valor"
+  ) %>%
+  mutate(
+    variable = recode(
+      variable,
+      mag = "Magnitud",
+      depth = "Profundidad"
+    )
+  ) %>%
+  ggplot(
+    aes(
+      x = variable,
+      y = valor
+    )
+  ) +
+  geom_boxplot(
+    width = 0.55
+  ) +
+  facet_wrap(
+    ~ variable,
+    scales = "free_y"
+  ) +
+  labs(
+    title = "Diagnóstico de valores atípicos",
+    subtitle = "Los valores extremos se inspeccionan, no se eliminan automáticamente",
+    x = NULL,
+    y = NULL
+  ) +
+  tema_reporte +
+  theme(
+    legend.position = "none"
+  )
+```
+
+**Decisión.** Los valores extremos plausibles se conservan. En sismología, una magnitud o profundidad poco frecuente puede representar precisamente un evento de interés. El criterio IQR no se utiliza como regla de eliminación automática. Esta decisión también evita borrar la estructura que posteriormente puede ser identificada por el modelo de agrupamiento.
+
+## Base analítica y decisiones finales de limpieza
+
+Las variables esenciales para el análisis son fecha, localización, profundidad y magnitud. Los registros con ausencia en cualquiera de estas variables no pueden utilizarse de manera consistente en las visualizaciones centrales ni en el modelo.
+
+```{r base-analitica}
+variables_core <- c(
+  "fecha_hora",
+  "latitude",
+  "longitude",
+  "depth",
+  "mag"
+)
+
+n_antes_core <- nrow(df)
+
+df_analisis <- df %>%
+  drop_na(
+    all_of(variables_core)
+  ) %>%
+  select(
+    id,
+    fecha_hora,
+    fecha,
+    anio,
+    mes_num,
+    mes,
+    latitude,
+    longitude,
+    depth,
+    mag,
+    place,
+    any_of(
+      c(
+        "magType",
+        "net",
+        "status",
+        "magSource",
+        "locationSource",
+        "horizontalError",
+        "depthError",
+        "magError",
+        "magNst",
+        "nst",
+        "gap",
+        "dmin",
+        "rms"
+      )
+    )
+  )
+
+n_excluidos_core <- n_antes_core - nrow(df_analisis)
+
+tibble(
+  etapa = c(
+    "Eventos earthquake sin duplicados",
+    "Base analítica completa"
+  ),
+  registros = c(
+    n_antes_core,
+    nrow(df_analisis)
+  )
+) %>%
+  kable(
+    caption = "Impacto de las decisiones de limpieza"
+  )
+```
+
+En total se excluyeron `r n_excluidos_core` registros por ausencia en variables esenciales. No se imputaron valores y no se eliminaron observaciones únicamente por ser atípicas.
+
+# Análisis exploratorio
+
+El EDA se organiza alrededor de las preguntas secundarias. Se evitan visualizaciones redundantes: cada gráfico responde una pregunta concreta sobre frecuencia, profundidad, tiempo, espacio o relación entre variables.
+
+## Resumen descriptivo
+
+```{r resumen-descriptivo}
+resumen <- df_analisis %>%
+  summarise(
+    eventos = n(),
+    magnitud_media = mean(mag),
+    magnitud_mediana = median(mag),
+    magnitud_minima = min(mag),
+    magnitud_maxima = max(mag),
+    profundidad_media = mean(depth),
+    profundidad_mediana = median(depth),
+    profundidad_minima = min(depth),
+    profundidad_maxima = max(depth)
+  )
+
+kable(
+  resumen,
+  digits = 2,
+  caption = "Resumen descriptivo de los eventos analizados"
+)
+```
+
+La diferencia entre media y mediana de profundidad permite evaluar la asimetría de la distribución. Los resultados se interpretan conjuntamente con el histograma y los perfiles de agrupamiento.
+
+## Magnitud y frecuencia acumulada
+
+```{r distribucion-magnitud}
+ggplot(
+  df_analisis,
+  aes(x = mag)
+) +
+  geom_histogram(
+    binwidth = 0.1,
+    boundary = 5
+  ) +
+  labs(
+    title = "Distribución de la magnitud",
+    subtitle = "Eventos con magnitud preferida ≥ 5",
+    x = "Magnitud",
+    y = "Número de eventos"
+  ) +
+  tema_reporte
+```
+
+Para responder directamente cómo cambia la frecuencia al aumentar el umbral de magnitud se calcula el número acumulado de eventos con \(M \geq m\).
+
+```{r frecuencia-umbral}
+umbrales <- seq(
+  from = 5,
+  to = floor(max(df_analisis$mag) * 10) / 10,
+  by = 0.1
+)
+
+tabla_umbrales <- tibble(
+  umbral = umbrales,
+  eventos = map_int(
+    umbrales,
+    ~ sum(
+      df_analisis$mag >= .x
+    )
+  )
+) %>%
+  filter(eventos > 0)
+
+ggplot(
+  tabla_umbrales,
+  aes(
+    x = umbral,
+    y = eventos
+  )
+) +
+  geom_line() +
+  geom_point(size = 1.6) +
+  scale_y_log10() +
+  labs(
+    title = "Frecuencia acumulada según umbral de magnitud",
+    subtitle = "Escala logarítmica en el eje vertical",
+    x = "Umbral de magnitud m",
+    y = "Eventos con M ≥ m"
+  ) +
+  tema_reporte
+```
+
+La disminución de la frecuencia acumulada conforme aumenta la magnitud es uno de los patrones principales del catálogo. La gráfica se utiliza de manera descriptiva; no se estima formalmente un valor \(b\) de Gutenberg-Richter porque ello requeriría evaluar de manera específica la magnitud de completitud y la homogeneidad de la escala de magnitud.
+
+## Profundidad
+
+```{r categorias-profundidad}
+df_analisis <- df_analisis %>%
+  mutate(
+    categoria_profundidad = case_when(
+      depth < 70 ~ "Superficial (<70 km)",
+      depth >= 70 & depth < 300 ~ "Intermedia (70-300 km)",
+      depth >= 300 ~ "Profunda (>=300 km)",
+      TRUE ~ NA_character_
+    ),
+    categoria_profundidad = factor(
+      categoria_profundidad,
+      levels = c(
+        "Superficial (<70 km)",
+        "Intermedia (70-300 km)",
+        "Profunda (>=300 km)"
+      )
+    )
+  )
+
+tabla_profundidad <- df_analisis %>%
+  count(
+    categoria_profundidad,
+    name = "n"
+  ) %>%
+  mutate(
+    porcentaje = 100 * n / sum(n)
+  )
+
+kable(
+  tabla_profundidad,
+  digits = 2,
+  caption = "Eventos según categoría descriptiva de profundidad"
+)
+```
+
+```{r hist-profundidad}
+ggplot(
+  df_analisis,
+  aes(x = depth)
+) +
+  geom_histogram(
+    bins = 30
+  ) +
+  labs(
+    title = "Distribución de la profundidad",
+    x = "Profundidad (km)",
+    y = "Número de eventos"
+  ) +
+  tema_reporte
+```
+
+La clasificación de profundidad es descriptiva y no constituye por sí sola una clasificación tectónica.
+
+## Comportamiento temporal
+
+```{r eventos-anio}
+eventos_anio <- df_analisis %>%
+  count(
+    anio,
+    name = "eventos"
+  ) %>%
+  mutate(
+    periodo = if_else(
+      anio == 2026,
+      "2026 parcial",
+      "Año completo"
+    )
+  )
+
+ggplot(
+  eventos_anio,
+  aes(
+    x = anio,
+    y = eventos,
+    group = 1
+  )
+) +
+  geom_line() +
+  geom_point(
+    aes(
+      shape = periodo
+    ),
+    size = 2.6
+  ) +
+  scale_x_continuous(
+    breaks = sort(
+      unique(eventos_anio$anio)
+    )
+  ) +
+  labs(
+    title = "Eventos sísmicos registrados por año",
+    subtitle = "2026 contiene información únicamente hasta el 19 de septiembre",
+    x = "Año",
+    y = "Número de eventos",
+    shape = NULL
+  ) +
+  tema_reporte
+```
+
+El conteo de 2026 se identifica explícitamente como parcial y no se utiliza para afirmar un incremento o decremento anual sin ajustar por exposición temporal.
+
+## Distribución espacial
+
+```{r mapa-eventos}
+mapa_mundo <- map_data(
+  "world"
+)
+
+ggplot() +
+  geom_polygon(
+    data = mapa_mundo,
+    aes(
+      x = long,
+      y = lat,
+      group = group
+    ),
+    fill = "grey94",
+    color = "grey75",
+    linewidth = 0.25
+  ) +
+  geom_point(
+    data = df_analisis,
+    aes(
+      x = longitude,
+      y = latitude,
+      size = mag
+    ),
+    alpha = 0.55
+  ) +
+  coord_quickmap(
+    xlim = c(min_lon, max_lon),
+    ylim = c(min_lat, max_lat),
+    expand = FALSE
+  ) +
+  labs(
+    title = "Distribución espacial de los eventos sísmicos",
+    subtitle = "México y su entorno, M ≥ 5",
+    x = "Longitud",
+    y = "Latitud",
+    size = "Magnitud"
+  ) +
+  tema_reporte
+```
+
+La concentración de eventos no es uniforme en el dominio estudiado. Este patrón espacial justifica incorporar la posición de los eventos en el análisis de agrupamiento.
+
+## Relación entre profundidad y magnitud
+
+```{r dispersion-profundidad-magnitud}
+ggplot(
+  df_analisis,
+  aes(
+    x = depth,
+    y = mag
+  )
+) +
+  geom_point(
+    alpha = 0.5
+  ) +
+  geom_smooth(
+    method = "loess",
+    se = FALSE
+  ) +
+  labs(
+    title = "Magnitud y profundidad de los eventos",
+    x = "Profundidad (km)",
+    y = "Magnitud"
+  ) +
+  tema_reporte
+```
+
+Se utiliza la correlación de Spearman porque no exige normalidad y evalúa asociación monotónica.
+
+```{r spearman}
+cor_test <- cor.test(
+  df_analisis$depth,
+  df_analisis$mag,
+  method = "spearman",
+  exact = FALSE
+)
+
+resultado_cor <- tibble(
+  rho = unname(
+    cor_test$estimate
+  ),
+  p_value = cor_test$p.value
+)
+
+kable(
+  resultado_cor,
+  digits = 4,
+  caption = "Correlación de Spearman entre profundidad y magnitud"
+)
+```
+
+La asociación estimada es \(\rho =\) `r round(unname(cor_test$estimate), 3)` con \(p=\) `r format.pval(cor_test$p.value, digits = 3)`. `r if (cor_test$p.value < 0.05) "Con un nivel de significancia de 5%, se encuentra evidencia de una asociación monotónica; su magnitud debe interpretarse a partir del valor absoluto de rho." else "Con un nivel de significancia de 5%, no se encuentra evidencia suficiente de una asociación monotónica entre profundidad y magnitud."`
+
+# Modelado: perfiles mediante K-Means
+
+## Justificación del modelo
+
+K-Means es adecuado para explorar si los eventos pueden resumirse mediante grupos relativamente compactos en un espacio multivariado. El modelo utiliza localización y profundidad, variables directamente vinculadas con la pregunta principal.
+
+Este es un problema **no supervisado**: no existe una etiqueta verdadera de clúster que permita una separación convencional de entrenamiento y prueba. Por ello, la evaluación no se basa en accuracy u otras métricas predictivas, sino en:
+
+- comparación de distintas configuraciones de \(K\);
+- cohesión y separación mediante Silhouette;
+- método del codo;
+- Gap Statistic como criterio complementario;
+- interpretación de los perfiles;
+- contraste externo con una variable que no participó en la construcción: la magnitud;
+- análisis de sensibilidad con DBSCAN, un método basado en densidad que no requiere fijar previamente el número de grupos y puede clasificar observaciones como ruido.
+
+## Proyección espacial y estandarización
+
+K-Means utiliza distancia euclidiana. Por ello, las coordenadas geográficas no se introducen directamente como grados. Los epicentros se transforman de WGS84 (EPSG:4326) a **Mexico ITRF2008 / Lambert Conformal Conic (EPSG:6372)**, una proyección en metros centrada en México.
+
+```{r preparar-clustering}
+df_cluster <- df_analisis %>%
+  select(
+    id,
+    fecha_hora,
+    place,
+    longitude,
+    latitude,
+    depth,
+    mag,
+    any_of(
+      c(
+        "magType",
+        "net",
+        "status"
+      )
+    )
+  ) %>%
+  drop_na(
+    longitude,
+    latitude,
+    depth
+  )
+
+puntos_sf <- st_as_sf(
+  df_cluster,
+  coords = c(
+    "longitude",
+    "latitude"
+  ),
+  crs = 4326,
+  remove = FALSE
+)
+
+puntos_lcc <- st_transform(
+  puntos_sf,
+  crs = 6372
+)
+
+coord_lcc <- st_coordinates(
+  puntos_lcc
+)
+
+df_cluster <- df_cluster %>%
+  mutate(
+    x_m = coord_lcc[, 1],
+    y_m = coord_lcc[, 2]
+  )
+
+X_cluster_original <- df_cluster %>%
+  select(
+    x_m,
+    y_m,
+    depth
+  )
+
+X_cluster <- scale(
+  X_cluster_original
+)
+
+colnames(X_cluster) <- c(
+  "X",
+  "Y",
+  "Profundidad"
+)
+```
+
+La estandarización transforma cada variable a media cero y desviación estándar uno, evitando que una variable domine la distancia únicamente por su escala numérica.
+
+La magnitud **no se utiliza** para construir los grupos. Se reserva para una evaluación posterior.
+
+## Selección de \(K\)
+
+### Método del codo
+
+```{r codo}
+ks_wss <- 1:8
+
+wss <- map_dbl(
+  ks_wss,
+  function(k) {
+    kmeans(
+      X_cluster,
+      centers = k,
+      nstart = 100
+    )$tot.withinss
+  }
+)
+
+resultado_codo <- tibble(
+  k = ks_wss,
+  wss = wss
+)
+
+ggplot(
+  resultado_codo,
+  aes(
+    x = k,
+    y = wss
+  )
+) +
+  geom_line() +
+  geom_point(size = 2.4) +
+  scale_x_continuous(
+    breaks = 1:8
+  ) +
+  labs(
+    title = "Selección de K: método del codo",
+    subtitle = "Menor WSS implica mayor homogeneidad interna",
+    x = "Número de clústeres (K)",
+    y = "WSS"
+  ) +
+  tema_reporte
+```
+
+### Silhouette promedio
+
+```{r silhouette-seleccion}
+ks <- 2:8
+dist_cluster <- dist(
+  X_cluster
+)
+
+sil_prom <- map_dbl(
+  ks,
+  function(k) {
+
+    modelo <- kmeans(
+      X_cluster,
+      centers = k,
+      nstart = 100
+    )
+
+    sil <- silhouette(
+      modelo$cluster,
+      dist_cluster
+    )
+
+    mean(
+      sil[, "sil_width"]
+    )
+  }
+)
+
+resultado_silueta <- tibble(
+  k = ks,
+  silueta_promedio = sil_prom
+)
+
+k_silueta <- resultado_silueta %>%
+  slice_max(
+    silueta_promedio,
+    n = 1,
+    with_ties = FALSE
+  ) %>%
+  pull(k)
+
+ggplot(
+  resultado_silueta,
+  aes(
+    x = k,
+    y = silueta_promedio
+  )
+) +
+  geom_line() +
+  geom_point(size = 2.4) +
+  scale_x_continuous(
+    breaks = 2:8
+  ) +
+  labs(
+    title = "Selección de K: Silhouette promedio",
+    subtitle = "Valores mayores indican mayor cohesión y separación",
+    x = "Número de clústeres (K)",
+    y = "Silhouette promedio"
+  ) +
+  tema_reporte
+```
+
+### Gap Statistic
+
+```{r gap-statistic}
+gap_stat <- clusGap(
+  X_cluster,
+  FUNcluster = function(x, k) {
+    kmeans(
+      x,
+      centers = k,
+      nstart = 100
+    )
+  },
+  K.max = 12,
+  B = 100,
+  d.power = 2,
+  spaceH0 = "scaledPCA"
+)
+
+resultado_gap <- as_tibble(
+  gap_stat$Tab
+) %>%
+  mutate(
+    k = row_number()
+  )
+
+k_gap <- maxSE(
+  gap_stat$Tab[, "gap"],
+  gap_stat$Tab[, "SE.sim"],
+  method = "Tibs2001SEmax"
+)
+
+ggplot(
+  resultado_gap,
+  aes(
+    x = k,
+    y = gap
+  )
+) +
+  geom_line() +
+  geom_point(size = 2.4) +
+  geom_errorbar(
+    aes(
+      ymin = gap - SE.sim,
+      ymax = gap + SE.sim
+    ),
+    width = 0.15
+  ) +
+  scale_x_continuous(
+    breaks = 1:12
+  ) +
+  labs(
+    title = "Gap Statistic",
+    subtitle = "Barras: ±1 error estándar",
+    x = "Número de clústeres (K)",
+    y = "Gap"
+  ) +
+  tema_reporte
+```
+
+La selección final se realiza considerando conjuntamente los tres criterios y la interpretabilidad. En la versión evaluada del proyecto, la Silhouette favorece \(K=2\), mientras que \(K=3\) conserva una calidad muy cercana y permite distinguir un perfil de profundidad claramente diferenciado. El Gap Statistic se utiliza como criterio complementario y no como regla única de decisión.
+
+Por parsimonia, calidad de separación e interpretabilidad se fija:
+
+\[
+\boxed{K=3}
+\]
+
+## Modelo final y calidad del agrupamiento
+
+```{r kmeans-final}
+k_elegido <- 3
+
+modelo_kmeans <- kmeans(
+  X_cluster,
+  centers = k_elegido,
+  nstart = 100
+)
+
+df_kmeans <- df_cluster %>%
+  mutate(
+    cluster_kmeans = factor(
+      modelo_kmeans$cluster
+    )
+  )
+
+sil_final <- silhouette(
+  modelo_kmeans$cluster,
+  dist_cluster
+)
+
+sil_df <- as.data.frame(
+  sil_final
+)
+
+silhouette_global <- mean(
+  sil_df$sil_width
+)
+
+n_sil_negativos <- sum(
+  sil_df$sil_width < 0
+)
+
+porcentaje_sil_negativos <- 100 *
+  mean(
+    sil_df$sil_width < 0
+  )
+
+sil_por_cluster <- sil_df %>%
+  as_tibble() %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    silhouette_media = mean(sil_width),
+    silhouette_mediana = median(sil_width),
+    n_negativos = sum(sil_width < 0),
+    porcentaje_negativos =
+      100 * mean(sil_width < 0),
+    .groups = "drop"
+  )
+
+kable(
+  sil_por_cluster,
+  digits = 3,
+  caption = "Calidad de asignación por clúster"
+)
+```
+
+La Silhouette global del modelo final es `r round(silhouette_global, 3)`. Se identificaron `r n_sil_negativos` observaciones con Silhouette negativa (`r round(porcentaje_sil_negativos, 2)`%), indicador utilizado para detectar asignaciones potencialmente ambiguas.
+
+```{r silhouette-final-grafica}
+ggplot(
+  sil_df,
+  aes(
+    x = factor(cluster),
+    y = sil_width,
+    fill = factor(cluster)
+  )
+) +
+  geom_boxplot(
+    alpha = 0.75
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Calidad de asignación por perfil",
+    subtitle = "Valores negativos indicarían posible afinidad con otro clúster",
+    x = "Clúster",
+    y = "Silhouette"
+  ) +
+  guides(
+    fill = "none"
+  ) +
+  tema_reporte
+```
+
+## Caracterización de los perfiles
+
+```{r perfiles-kmeans}
+perfil_kmeans <- df_kmeans %>%
+  group_by(
+    cluster_kmeans
+  ) %>%
+  summarise(
+    n = n(),
+    porcentaje =
+      100 * n / nrow(df_kmeans),
+    longitud_media =
+      mean(longitude),
+    latitud_media =
+      mean(latitude),
+    profundidad_media =
+      mean(depth),
+    profundidad_mediana =
+      median(depth),
+    profundidad_min =
+      min(depth),
+    profundidad_max =
+      max(depth),
+    magnitud_media =
+      mean(mag),
+    magnitud_mediana =
+      median(mag),
+    magnitud_maxima =
+      max(mag),
+    .groups = "drop"
+  )
+
+kable(
+  perfil_kmeans,
+  digits = 2,
+  caption = "Características de los perfiles identificados mediante K-Means"
+)
+```
+
+```{r mapa-clusters}
+ggplot() +
+  geom_polygon(
+    data = mapa_mundo,
+    aes(
+      x = long,
+      y = lat,
+      group = group
+    ),
+    fill = "grey94",
+    color = "grey75",
+    linewidth = 0.25
+  ) +
+  geom_point(
+    data = df_kmeans,
+    aes(
+      x = longitude,
+      y = latitude,
+      color = cluster_kmeans,
+      size = mag
+    ),
+    alpha = 0.72
+  ) +
+  coord_quickmap(
+    xlim = c(min_lon, max_lon),
+    ylim = c(min_lat, max_lat),
+    expand = FALSE
+  ) +
+  labs(
+    title = "Perfiles sísmicos identificados mediante K-Means",
+    subtitle = "Los grupos se construyen con localización proyectada y profundidad",
+    x = "Longitud",
+    y = "Latitud",
+    color = "Clúster",
+    size = "Magnitud"
+  ) +
+  tema_reporte
+```
+
+```{r profundidad-clusters}
+ggplot(
+  df_kmeans,
+  aes(
+    x = cluster_kmeans,
+    y = depth,
+    fill = cluster_kmeans
+  )
+) +
+  geom_boxplot(
+    alpha = 0.75,
+    width = 0.65
+  ) +
+  labs(
+    title = "Distribución de profundidad por perfil",
+    subtitle = "La profundidad sí participa en la construcción del modelo",
+    x = "Clúster",
+    y = "Profundidad (km)"
+  ) +
+  guides(
+    fill = "none"
+  ) +
+  tema_reporte
+```
+
+Los perfiles deben interpretarse mediante la tabla y las distribuciones, no únicamente por el número asignado al clúster. La numeración 1, 2 y 3 no implica un orden físico.
+
+## Magnitud como validación externa
+
+La magnitud no intervino en K-Means. Por ello, se evalúa posteriormente si su distribución difiere entre los perfiles.
+
+```{r kruskal-magnitud}
+kruskal_mag <- kruskal.test(
+  mag ~ cluster_kmeans,
+  data = df_kmeans
+)
+
+H <- as.numeric(
+  kruskal_mag$statistic
+)
+
+n_total <- nrow(
+  df_kmeans
+)
+
+numero_clusters <- nlevels(
+  df_kmeans$cluster_kmeans
+)
+
+epsilon2 <- (
+  H - numero_clusters + 1
+) / (
+  n_total - numero_clusters
+)
+
+resultado_kruskal <- tibble(
+  H = H,
+  gl = as.numeric(
+    kruskal_mag$parameter
+  ),
+  p_value = kruskal_mag$p.value,
+  epsilon_cuadrada = epsilon2
+)
+
+kable(
+  resultado_kruskal,
+  digits = 4,
+  caption = "Kruskal-Wallis y tamaño de efecto para magnitud"
+)
+```
+
+`r if (kruskal_mag$p.value < 0.05) "La prueba de Kruskal-Wallis encuentra evidencia de diferencias en la distribución de magnitud entre al menos dos perfiles." else "La prueba de Kruskal-Wallis no encuentra evidencia suficiente de diferencias en la distribución de magnitud entre los perfiles."` El tamaño de efecto estimado es \(\epsilon^2=\) `r round(epsilon2, 3)`, por lo que la significancia estadística debe interpretarse conjuntamente con la magnitud práctica de la diferencia.
+
+```{r posthoc-magnitud}
+comparaciones_mag <- pairwise.wilcox.test(
+  x = df_kmeans$mag,
+  g = df_kmeans$cluster_kmeans,
+  p.adjust.method = "holm",
+  exact = FALSE
+)
+
+posthoc_mag <- as.data.frame(
+  as.table(
+    comparaciones_mag$p.value
+  )
+) %>%
+  as_tibble() %>%
+  filter(
+    !is.na(Freq)
+  ) %>%
+  transmute(
+    cluster_1 = as.character(Var1),
+    cluster_2 = as.character(Var2),
+    p_ajustado = Freq,
+    diferencia_significativa =
+      if_else(
+        p_ajustado < 0.05,
+        "Sí",
+        "No"
+      )
+  )
+
+kable(
+  posthoc_mag,
+  digits = 4,
+  caption = "Comparaciones post hoc de magnitud entre clústeres"
+)
+```
+
+```{r magnitud-clusters}
+ggplot(
+  df_kmeans,
+  aes(
+    x = cluster_kmeans,
+    y = mag,
+    fill = cluster_kmeans
+  )
+) +
+  geom_boxplot(
+    alpha = 0.75,
+    width = 0.65
+  ) +
+  labs(
+    title = "Distribución de magnitud por perfil",
+    subtitle = paste0(
+      "Kruskal-Wallis: p = ",
+      format.pval(
+        kruskal_mag$p.value,
+        digits = 3
+      )
+    ),
+    x = "Clúster",
+    y = "Magnitud"
+  ) +
+  guides(
+    fill = "none"
+  ) +
+  tema_reporte
+```
+
+## Análisis de sensibilidad con DBSCAN
+
+K-Means favorece grupos compactos alrededor de centroides y obliga a asignar todos los eventos a algún clúster. Como análisis de sensibilidad se utiliza **DBSCAN** (*Density-Based Spatial Clustering of Applications with Noise*), que identifica regiones densas sin fijar previamente el número de grupos y puede clasificar observaciones localizadas en regiones poco densas como ruido.
+
+La comparación no busca seleccionar un “ganador” entre algoritmos. Su propósito es evaluar si la estructura obtenida con K-Means persiste, al menos parcialmente, cuando se utiliza un supuesto geométrico diferente. Para que la comparación sea consistente, DBSCAN se aplica exactamente sobre las mismas tres variables estandarizadas utilizadas por K-Means: coordenadas proyectadas \(X\), \(Y\) y profundidad.
+
+### Selección de parámetros
+
+DBSCAN requiere dos parámetros: \(\varepsilon\), que define el radio de vecindad, y `minPts`, que establece el número mínimo de observaciones necesarias para considerar una zona como suficientemente densa.
+
+Como regla operativa reproducible se fija `minPts` en dos veces el número de dimensiones utilizadas. Dado que el modelo trabaja con tres variables, se utiliza `minPts = 6`. Esta elección es una heurística de trabajo y no una propiedad universal del algoritmo.
+
+```{r dbscan-parametros}
+dimension_dbscan <- ncol(
+  X_cluster
+)
+
+minPts_dbscan <- 2 * dimension_dbscan
+
+k_dbscan <- minPts_dbscan - 1
+
+dist_knn <- dbscan::kNNdist(
+  X_cluster,
+  k = k_dbscan
+)
+
+df_knn <- tibble(
+  indice = seq_along(
+    dist_knn
+  ),
+  distancia = sort(
+    dist_knn
+  )
+)
+
+ggplot(
+  df_knn,
+  aes(
+    x = indice,
+    y = distancia
+  )
+) +
+  geom_line() +
+  labs(
+    title = "Distancias al vecino k para DBSCAN",
+    subtitle = paste0(
+      "k = ",
+      k_dbscan,
+      "; el incremento de la curva orienta la búsqueda de eps"
+    ),
+    x = "Observaciones ordenadas",
+    y = "Distancia al vecino k"
+  ) +
+  tema_reporte
+```
+
+La gráfica de distancias k-NN se utiliza como diagnóstico. Para evitar seleccionar visualmente un valor de \(\varepsilon\), se evalúa además una rejilla de candidatos y se utiliza el índice **DBCV** (*Density-Based Clustering Validation*) como criterio cuantitativo. Valores mayores de DBCV indican una mejor relación entre compactación y separación bajo una estructura basada en densidad.
+
+```{r dbscan-evaluacion-eps}
+eps_min <- as.numeric(
+  quantile(
+    dist_knn,
+    0.50,
+    na.rm = TRUE
+  )
+)
+
+eps_max <- as.numeric(
+  quantile(
+    dist_knn,
+    0.99,
+    na.rm = TRUE
+  )
+)
+
+eps_grid <- seq(
+  eps_min,
+  eps_max,
+  length.out = 50
+)
+
+evaluacion_dbscan <- map_dfr(
+  eps_grid,
+  function(eps_i) {
+
+    modelo_i <- dbscan::dbscan(
+      X_cluster,
+      eps = eps_i,
+      minPts = minPts_dbscan
+    )
+
+    etiquetas_i <- modelo_i$cluster
+
+    n_clusters_i <- length(
+      setdiff(
+        unique(etiquetas_i),
+        0L
+      )
+    )
+
+    proporcion_ruido_i <- mean(
+      etiquetas_i == 0L
+    )
+
+    dbcv_i <- if (n_clusters_i >= 2) {
+      tryCatch(
+        dbscan::dbcv(
+          X_cluster,
+          etiquetas_i
+        )$score,
+        error = function(e) NA_real_
+      )
+    } else {
+      NA_real_
+    }
+
+    tibble(
+      eps = eps_i,
+      n_clusters = n_clusters_i,
+      proporcion_ruido = proporcion_ruido_i,
+      dbcv = dbcv_i
+    )
+  }
+)
+
+candidatos_dbscan <- evaluacion_dbscan %>%
+  filter(
+    n_clusters >= 2,
+    !is.na(dbcv)
+  )
+
+if (nrow(candidatos_dbscan) == 0) {
+  stop(
+    "No se encontró una configuración DBSCAN válida en la rejilla evaluada. Amplía el intervalo de eps."
+  )
+}
+
+mejor_dbscan <- candidatos_dbscan %>%
+  slice_max(
+    dbcv,
+    n = 1,
+    with_ties = FALSE
+  )
+
+eps_dbscan <- mejor_dbscan %>%
+  pull(eps)
+
+eps_en_borde <- isTRUE(
+  all.equal(
+    eps_dbscan,
+    min(eps_grid)
+  )
+) || isTRUE(
+  all.equal(
+    eps_dbscan,
+    max(eps_grid)
+  )
+)
+
+if (eps_en_borde) {
+  warning(
+    "El mejor eps quedó en un extremo de la rejilla. Conviene ampliar el intervalo antes de interpretar DBSCAN."
+  )
+}
+
+ggplot(
+  candidatos_dbscan,
+  aes(
+    x = eps,
+    y = dbcv
+  )
+) +
+  geom_line() +
+  geom_point(
+    size = 1.8
+  ) +
+  geom_vline(
+    xintercept = eps_dbscan,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Selección de eps mediante DBCV",
+    subtitle = "La línea vertical indica el mejor valor dentro de la rejilla evaluada",
+    x = "eps",
+    y = "DBCV"
+  ) +
+  tema_reporte
+```
+
+### Modelo DBSCAN final
+
+```{r dbscan-final}
+modelo_dbscan <- dbscan::dbscan(
+  X_cluster,
+  eps = eps_dbscan,
+  minPts = minPts_dbscan
+)
+
+cluster_dbscan_num <- modelo_dbscan$cluster
+
+n_clusters_dbscan <- length(
+  setdiff(
+    unique(cluster_dbscan_num),
+    0L
+  )
+)
+
+n_ruido_dbscan <- sum(
+  cluster_dbscan_num == 0L
+)
+
+porcentaje_ruido_dbscan <- 100 * mean(
+  cluster_dbscan_num == 0L
+)
+
+dbcv_final <- dbscan::dbcv(
+  X_cluster,
+  cluster_dbscan_num
+)$score
+
+niveles_dbscan <- c(
+  paste0(
+    "D",
+    sort(
+      unique(
+        cluster_dbscan_num[
+          cluster_dbscan_num > 0
+        ]
+      )
+    )
+  ),
+  "Ruido"
+)
+
+df_dbscan <- df_cluster %>%
+  mutate(
+    cluster_dbscan_num = cluster_dbscan_num,
+    cluster_dbscan = if_else(
+      cluster_dbscan_num == 0L,
+      "Ruido",
+      paste0(
+        "D",
+        cluster_dbscan_num
+      )
+    ),
+    cluster_dbscan = factor(
+      cluster_dbscan,
+      levels = niveles_dbscan
+    )
+  )
+
+resumen_dbscan <- tibble(
+  minPts = minPts_dbscan,
+  eps = eps_dbscan,
+  clusters = n_clusters_dbscan,
+  eventos_ruido = n_ruido_dbscan,
+  porcentaje_ruido = porcentaje_ruido_dbscan,
+  DBCV = dbcv_final
+)
+
+kable(
+  resumen_dbscan,
+  digits = 3,
+  caption = "Resumen del análisis de sensibilidad con DBSCAN"
+)
+```
+
+DBSCAN identificó `r n_clusters_dbscan` grupos basados en densidad y clasificó `r n_ruido_dbscan` eventos como ruido (`r round(porcentaje_ruido_dbscan, 1)`%). El valor DBCV de la solución seleccionada fue `r round(dbcv_final, 3)`. Estos resultados se utilizan como diagnóstico de sensibilidad y no como una sustitución automática del modelo principal.
+`r if (eps_en_borde) "El eps seleccionado coincidió con un extremo de la rejilla evaluada; antes de cerrar la interpretación debe ampliarse el intervalo y repetir la búsqueda." else "El eps seleccionado quedó dentro del intervalo evaluado, por lo que la búsqueda no terminó en uno de los extremos de la rejilla."`
+
+```{r mapa-dbscan}
+ggplot() +
+  geom_polygon(
+    data = mapa_mundo,
+    aes(
+      x = long,
+      y = lat,
+      group = group
+    ),
+    fill = "grey94",
+    color = "grey75",
+    linewidth = 0.25
+  ) +
+  geom_point(
+    data = df_dbscan,
+    aes(
+      x = longitude,
+      y = latitude,
+      color = cluster_dbscan,
+      size = mag
+    ),
+    alpha = 0.72
+  ) +
+  coord_quickmap(
+    xlim = c(min_lon, max_lon),
+    ylim = c(min_lat, max_lat),
+    expand = FALSE
+  ) +
+  labs(
+    title = "Agrupamiento alternativo mediante DBSCAN",
+    subtitle = "Los eventos clasificados como ruido no pertenecen a regiones suficientemente densas",
+    x = "Longitud",
+    y = "Latitud",
+    color = "DBSCAN",
+    size = "Magnitud"
+  ) +
+  tema_reporte
+```
+
+### Comparación descriptiva con K-Means
+
+Como las etiquetas numéricas de los dos algoritmos son arbitrarias, no se comparan por igualdad de número de clúster. Se utiliza una tabla cruzada para observar si los perfiles de K-Means permanecen concentrados en uno o varios grupos de DBSCAN y qué proporción de cada perfil es considerada ruido.
+
+```{r comparacion-kmeans-dbscan}
+comparacion_modelos <- df_kmeans %>%
+  select(
+    id,
+    cluster_kmeans
+  ) %>%
+  left_join(
+    df_dbscan %>%
+      select(
+        id,
+        cluster_dbscan_num,
+        cluster_dbscan
+      ),
+    by = "id"
+  )
+
+tabla_cruce_modelos <- table(
+  K_Means = comparacion_modelos$cluster_kmeans,
+  DBSCAN = comparacion_modelos$cluster_dbscan
+)
+
+tabla_cruce_modelos_df <- as.data.frame.matrix(
+  tabla_cruce_modelos
+) %>%
+  tibble::rownames_to_column(
+    "cluster_kmeans"
+  )
+
+kable(
+  tabla_cruce_modelos_df,
+  caption = "Correspondencia descriptiva entre K-Means y DBSCAN"
+)
+```
+
+La comparación muestra que la partición exacta de tres perfiles de K-Means **no se reproduce bajo el supuesto de densidad de DBSCAN**. En la solución seleccionada, DBSCAN concentra `r sum(comparacion_modelos$cluster_dbscan == "D1", na.rm = TRUE)` de los `r nrow(comparacion_modelos)` eventos en un solo grupo de densidad (D1), asigna `r sum(comparacion_modelos$cluster_dbscan == "D2", na.rm = TRUE)` eventos a D2 y clasifica `r sum(comparacion_modelos$cluster_dbscan == "Ruido", na.rm = TRUE)` como ruido.
+
+Esto no invalida K-Means. Ambos algoritmos responden a supuestos distintos: K-Means particiona el espacio en grupos compactos alrededor de centroides, mientras que DBSCAN busca regiones suficientemente densas y permite dejar observaciones sin asignar. Por ello, los tres grupos de K-Means deben interpretarse como **perfiles descriptivos útiles de localización y profundidad**, no como evidencia de tres poblaciones naturales completamente separadas. La comparación con DBSCAN indica que la estructura exacta es sensible al método de agrupamiento y fortalece una interpretación prudente de los resultados.
+
+## Limitaciones del modelo
+
+K-Means favorece grupos compactos alrededor de centroides y es sensible a escala y observaciones extremas. La estandarización controla la diferencia de unidades, pero no elimina por completo la influencia de valores extremos.
+
+Los clústeres son **perfiles estadísticos**, no regiones tectónicas oficiales. La asignación no incorpora mecanismos focales, geometría tridimensional de placas, tipo de falla ni dependencia temporal entre sismos de una misma secuencia.
+
+# Contexto tectónico externo
+
+El propósito de esta sección es aportar contexto independiente al resultado del modelo. Los límites de placa no se utilizan para construir los clústeres.
+
+Se utiliza el modelo digital PB2002 de Bird (2003) como referencia cartográfica. Debido a que una línea de límite de placa representa una geometría superficial, su proximidad en un mapa bidimensional no equivale a demostrar el origen tectónico de un evento profundo.
+
+```{r limites-tectonicos}
+dir.create(
+  "data/external",
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+archivo_placas <- file.path(
+  "data",
+  "external",
+  "PB2002_boundaries.json"
+)
+
+url_placas <- paste0(
+  "https://raw.githubusercontent.com/",
+  "fraxen/tectonicplates/master/GeoJSON/",
+  "PB2002_boundaries.json"
+)
+
+if (!file.exists(archivo_placas)) {
+  download.file(
+    url = url_placas,
+    destfile = archivo_placas,
+    mode = "wb"
+  )
+}
+
+limites_placas <- st_read(
+  archivo_placas,
+  quiet = TRUE
+)
+
+if (is.na(st_crs(limites_placas))) {
+  st_crs(limites_placas) <- 4326
+}
+
+bbox_estudio <- st_bbox(
+  c(
+    xmin = min_lon,
+    ymin = min_lat,
+    xmax = max_lon,
+    ymax = max_lat
+  ),
+  crs = st_crs(4326)
+)
+
+limites_estudio <- st_crop(
+  limites_placas,
+  bbox_estudio
+)
+```
+
+```{r mapa-tectonico}
+ggplot() +
+  geom_polygon(
+    data = mapa_mundo,
+    aes(
+      x = long,
+      y = lat,
+      group = group
+    ),
+    fill = "grey95",
+    color = "grey78",
+    linewidth = 0.2
+  ) +
+  geom_sf(
+    data = limites_estudio,
+    inherit.aes = FALSE,
+    linewidth = 0.75
+  ) +
+  geom_point(
+    data = df_kmeans,
+    aes(
+      x = longitude,
+      y = latitude,
+      color = cluster_kmeans,
+      size = mag
+    ),
+    alpha = 0.70
+  ) +
+  coord_sf(
+    xlim = c(min_lon, max_lon),
+    ylim = c(min_lat, max_lat),
+    expand = FALSE,
+    default_crs = st_crs(4326)
+  ) +
+  labs(
+    title = "Perfiles estadísticos y límites de placas",
+    subtitle = "PB2002 se utiliza únicamente como contexto geológico externo",
+    x = "Longitud",
+    y = "Latitud",
+    color = "Clúster",
+    size = "Magnitud"
+  ) +
+  tema_reporte
+```
+
+La lectura del mapa es descriptiva. La literatura sobre México documenta la interacción de las placas de Cocos y Rivera con Norteamérica y reconoce heterogeneidad sismotectónica en el sur del país. La coincidencia espacial parcial entre patrones del catálogo y límites tectónicos aporta interpretabilidad, pero no autoriza a identificar cada clúster con una placa o región tectónica específica.
+
+# Principales resultados
+
+- La base analítica final contiene `r nrow(df_analisis)` eventos de magnitud ≥ 5. No se detectaron IDs duplicados y no se excluyeron registros por ausencia en las variables esenciales del análisis.
+- La magnitud observada tiene media de `r round(mean(df_analisis$mag), 2)` y mediana de `r round(median(df_analisis$mag), 2)`, mientras que la profundidad presenta media de `r round(mean(df_analisis$depth), 2)` km y mediana de `r round(median(df_analisis$depth), 2)` km. La diferencia entre media y mediana de profundidad evidencia asimetría hacia eventos profundos.
+- La composición de `magType` se documenta porque la magnitud preferida de ComCat no procede necesariamente del mismo método en todos los eventos; por ello, diferencias pequeñas de magnitud deben interpretarse con cautela.
+- La frecuencia acumulada disminuye conforme aumenta el umbral de magnitud, por lo que los eventos de mayor magnitud son progresivamente menos frecuentes dentro de la muestra.
+- La correlación de Spearman entre profundidad y magnitud es \(\rho=\) `r round(unname(cor_test$estimate), 3)` con \(p=\) `r format.pval(cor_test$p.value, digits = 3)`. Con un nivel de significancia de 5%, no se encuentra evidencia suficiente de una asociación monotónica y la magnitud del coeficiente es débil.
+- K-Means se ajusta sobre coordenadas proyectadas y profundidad estandarizadas, no sobre grados de latitud y longitud. La solución final utiliza tres perfiles y obtiene una Silhouette promedio de `r round(silhouette_global, 3)`, sin observaciones con Silhouette negativa.
+- Los perfiles se diferencian principalmente por **localización y profundidad**. El perfil 2 presenta una profundidad mediana de `r round(perfil_kmeans$profundidad_mediana[perfil_kmeans$cluster_kmeans == "2"], 2)` km, frente a `r round(perfil_kmeans$profundidad_mediana[perfil_kmeans$cluster_kmeans == "1"], 2)` km en el perfil 1 y `r round(perfil_kmeans$profundidad_mediana[perfil_kmeans$cluster_kmeans == "3"], 2)` km en el perfil 3.
+- La magnitud, utilizada como variable externa al agrupamiento, presenta diferencias globales entre perfiles según Kruskal-Wallis (\(p=\) `r format.pval(kruskal_mag$p.value, digits = 3)`), pero el tamaño de efecto es pequeño (\(\epsilon^2=\) `r round(epsilon2, 3)`). En las comparaciones post hoc con ajuste de Holm, la diferencia significativa se concentra entre los perfiles 1 y 3.
+- Como análisis de sensibilidad, DBSCAN identifica `r n_clusters_dbscan` grupos basados en densidad y `r n_ruido_dbscan` eventos como ruido (`r round(porcentaje_ruido_dbscan, 1)`%); su DBCV es `r round(dbcv_final, 3)`. Sin embargo, `r sum(comparacion_modelos$cluster_dbscan == "D1", na.rm = TRUE)` de los `r nrow(comparacion_modelos)` eventos quedan concentrados en un único grupo de densidad, por lo que DBSCAN no reproduce la partición exacta de tres perfiles de K-Means.
+
+# Conclusiones
+
+El análisis de los `r nrow(df_analisis)` eventos de magnitud ≥ 5 muestra que la sismicidad del dominio estudiado presenta heterogeneidad espacial y de profundidad que puede resumirse mediante perfiles estadísticos. La solución de K-Means con tres grupos se conserva por el equilibrio entre separación e interpretabilidad: aunque la Silhouette favorece una solución más parsimoniosa, \(K=3\) mantiene una calidad cercana y permite distinguir un perfil de profundidad claramente diferenciado. Por ello, la selección no se basa en una única métrica, sino en la combinación de criterios de validación e interpretación.
+
+Los tres perfiles no deben leerse como regiones tectónicas oficiales. Su principal utilidad es separar combinaciones diferentes de localización y profundidad. El perfil 2 resulta especialmente distintivo por su profundidad mediana de `r round(perfil_kmeans$profundidad_mediana[perfil_kmeans$cluster_kmeans == "2"], 2)` km, frente a `r round(perfil_kmeans$profundidad_mediana[perfil_kmeans$cluster_kmeans == "1"], 2)` km en el perfil 1 y `r round(perfil_kmeans$profundidad_mediana[perfil_kmeans$cluster_kmeans == "3"], 2)` km en el perfil 3. En consecuencia, la profundidad aporta una señal estructural más clara que la magnitud para diferenciar los perfiles construidos.
+
+La magnitud se utilizó únicamente después del agrupamiento como variable externa, evitando una validación circular. Kruskal-Wallis detecta diferencias globales entre perfiles, pero el tamaño de efecto es pequeño (\(\epsilon^2=\) `r round(epsilon2, 3)`), por lo que la significancia estadística no implica una separación fuerte en magnitud. De forma consistente, la correlación de Spearman entre profundidad y magnitud es débil (\(\rho=\) `r round(unname(cor_test$estimate), 3)`) y no alcanza significancia al 5% (\(p=\) `r format.pval(cor_test$p.value, digits = 3)`). Por ello, la magnitud no aparece como el principal eje de diferenciación de los patrones encontrados.
+
+El análisis de sensibilidad mediante DBSCAN aporta una advertencia metodológica importante. Con los parámetros seleccionados, DBSCAN identifica `r n_clusters_dbscan` grupos y `r n_ruido_dbscan` observaciones de ruido, pero concentra `r sum(comparacion_modelos$cluster_dbscan == "D1", na.rm = TRUE)` de los `r nrow(comparacion_modelos)` eventos en un solo grupo de densidad. Esto significa que la estructura exacta de tres perfiles de K-Means **no es estable frente a un supuesto de agrupamiento basado en densidad**. En consecuencia, K-Means debe interpretarse como una herramienta de segmentación descriptiva útil y no como prueba de que existan tres poblaciones sísmicas naturalmente separadas.
+
+En conjunto, el proyecto responde una pregunta descriptiva y de segmentación sobre la sismicidad histórica observada en el dominio definido. Los resultados permiten caracterizar patrones espaciales y de profundidad y evaluar su estabilidad bajo métodos distintos, pero **no constituyen un modelo de pronóstico sísmico ni permiten inferir causalidad tectónica a partir de los clústeres**. El mapa tectónico se utiliza únicamente como contexto externo para valorar la correspondencia espacial descriptiva entre los perfiles y los límites de placas, sin interpretar dicha coincidencia como evidencia causal ni como una clasificación tectónica definitiva.
+
+# Limitaciones
+
+1. **Cobertura geográfica.** La muestra proviene de una caja rectangular y no coincide exactamente con la frontera política de México.
+2. **Umbral de magnitud.** Solo se consideran eventos con magnitud ≥ 5; por ello, el estudio no representa la sismicidad de menor magnitud ni permite caracterizar adecuadamente secuencias completas de réplicas pequeñas.
+3. **Año parcial.** El periodo 2026 termina el 19 de septiembre.
+4. **Catálogo vivo.** ComCat puede actualizar parámetros preferidos; por ello se conserva una copia local de los datos utilizados.
+5. **Heterogeneidad de magnitud.** Los registros pueden utilizar distintos `magType`, por lo que diferencias pequeñas deben interpretarse con cautela.
+6. **Supuestos de K-Means.** El método favorece grupos compactos y puede ser sensible a valores extremos.
+7. **Sensibilidad de DBSCAN.** El resultado depende de `eps` y `minPts`; en este proyecto se fija `minPts` mediante una heurística explícita y se selecciona `eps` dentro de una rejilla mediante DBCV, por lo que otras configuraciones pueden producir particiones diferentes.
+8. **Dependencia entre eventos.** El análisis trata cada registro como unidad de observación y no modela explícitamente la dependencia temporal entre evento principal y réplicas.
+9. **Interpretación tectónica.** Los límites de placas se utilizan únicamente como contexto bidimensional; no se incorpora la geometría tridimensional de la placa subducida ni mecanismos focales.
+10. **Proyección.** EPSG:6372 está diseñada para México; el dominio incluye zonas adyacentes, por lo que la proyección se utiliza como aproximación plana centrada en México para el análisis de distancias.
+
+# Posibles extensiones
+
+- ampliar el análisis de sensibilidad con PAM, HDBSCAN u OPTICS;
+- incorporar mecanismos focales y geometría de la losa subducida;
+- comparar ComCat con un catálogo nacional como el del Servicio Sismológico Nacional;
+- evaluar formalmente la magnitud de completitud antes de estimar parámetros de Gutenberg-Richter;
+- modelar secuencias temporales y relaciones evento principal–réplicas con un catálogo que incluya magnitudes menores;
+- evaluar estabilidad temporal de los clústeres mediante una validación por periodos.
+
+# Reproducibilidad y archivos de salida
+
+Para el dashboard se exporta una base con la clasificación final. El archivo se guarda en `data/processed`.
+
+```{r exportar-resultados}
+dir.create(
+  "data/processed",
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+df_cluster_resultado <- df_kmeans %>%
+  left_join(
+    df_dbscan %>%
+      select(
+        id,
+        cluster_dbscan
+      ),
+    by = "id"
+  ) %>%
+  select(
+    id,
+    fecha_hora,
+    longitude,
+    latitude,
+    depth,
+    mag,
+    cluster_kmeans,
+    cluster_dbscan,
+    everything()
+  ) %>%
+  distinct(
+    id,
+    .keep_all = TRUE
+  )
+
+readr::write_csv(
+  df_cluster_resultado,
+  file.path(
+    "data",
+    "processed",
+    "sismos_dashboard.csv"
+  )
+)
+```
+
+Para reproducir exactamente el proyecto se deben conservar en el repositorio:
+
+- este archivo `.Rmd`;
+- `data/raw/usgs_sismos_2015_2026-09-19.csv`;
+- `data/external/PB2002_boundaries.json`;
+- el archivo del Flexdashboard;
+- el `README.md`;
+- idealmente un archivo `renv.lock` generado desde el entorno local.
+
+# Bibliografía y fuentes
+
+Bird, P. (2003). *An updated digital model of plate boundaries*. **Geochemistry, Geophysics, Geosystems, 4**, 1027. https://doi.org/10.1029/2001GC000252
+
+EPSG. (s. f.). *Mexico ITRF2008 / LCC — EPSG:6372*. https://epsg.io/6372
+
+Instituto de Geofísica, UNAM. (s. f.). *Departamento de Sismología*. https://www.geofisica.unam.mx/sismologia/
+
+Mota Palomino, R., Andrieux, J., & Bonnin, J. (1986). *Bosquejo sismotectónico del sur de México*. **Geofísica Internacional, 25**(1), 207–231. https://doi.org/10.22201/igeof.00167169p.1986.25.1.805
+
+Ester, M., Kriegel, H.-P., Sander, J., & Xu, X. (1996). *A density-based algorithm for discovering clusters in large spatial databases with noise*. Proceedings of the Second International Conference on Knowledge Discovery and Data Mining, 226–231.
+
+Hahsler, M., Piekenbrock, M., & Doran, D. (2019). dbscan: Fast density-based clustering with R. *Journal of Statistical Software, 91*(1), 1–30. https://doi.org/10.18637/jss.v091.i01
+
+Moulavi, D., Jaskowiak, P. A., Campello, R. J. G. B., Zimek, A., & Sander, J. (2014). Density-based clustering validation. *Proceedings of the 2014 SIAM International Conference on Data Mining*, 839–847. https://doi.org/10.1137/1.9781611973440.96
+
+R Core Team. (2026). *R: A language and environment for statistical computing*. R Foundation for Statistical Computing. https://www.R-project.org/
+
+U.S. Geological Survey. (s. f.). *ANSS Comprehensive Earthquake Catalog (ComCat) Documentation*. https://earthquake.usgs.gov/data/comcat/
+
+U.S. Geological Survey. (s. f.). *FDSN Event Web Service*. https://earthquake.usgs.gov/fdsnws/event/1/
+
+Wickham, H., et al. (2019). Welcome to the tidyverse. *Journal of Open Source Software, 4*(43), 1686. https://doi.org/10.21105/joss.01686
+
+# Uso de inteligencia artificial
+
+Se utilizó ChatGPT (OpenAI) como herramienta de apoyo para:
+
+- revisar la estructura del código;
+- detectar inconsistencias y posibles errores de reproducibilidad;
+- proponer alternativas metodológicas;
+- explicar pruebas estadísticas y criterios de validación;
+- mejorar la claridad de la redacción y organización del reporte.
+
+Los datos proceden de USGS y los resultados numéricos, tablas y visualizaciones deben generarse mediante la ejecución del código del proyecto. La selección final de métodos, revisión de resultados e interpretación del análisis corresponden a la autora.
+
+# Información de la sesión
+
+La siguiente salida documenta el entorno utilizado para generar el reporte.
+
+```{r session-info}
+sessionInfo()
+```
